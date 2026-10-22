@@ -379,7 +379,10 @@ jobs:
 
       - name: 来源证明 (SLSA)
         if: steps.merge.outputs.index_digest != ''
-        uses: actions/attest-build-provenance@v1
+        # 用 actions/attest 而非 attest-build-provenance：
+        # 后者从 v2 起移除了 subject-name/subject-digest/push-to-registry，
+        # 只能 attest 文件产物，镜像场景需改用 actions/attest
+        uses: actions/attest@v4
         with:
           subject-name: ${{ needs.detect.outputs.prefix }}/${{ matrix.name }}
           subject-digest: ${{ steps.merge.outputs.index_digest }}
