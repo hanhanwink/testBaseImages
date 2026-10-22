@@ -1,5 +1,5 @@
 # =============================================================================
-# 目录即镜像（Directory-as-Image）自动构建流水线
+# 目录即镜像（Directory-as-Image）多架构构建流水线
 # -----------------------------------------------------------------------------
 # 规则：仓库根目录下每个含 Dockerfile 的子目录 = 一个镜像，推送到本仓库的 GHCR。
 #
@@ -23,8 +23,14 @@
 #   vX.Y.Z / X.Y / X  git tag 触发时按 semver 拆解
 #   YYYYMMDD-<sha7>   每日快照，同日多次构建也不会互相覆盖
 #
-# 说明：date 模板用 moment.js 语法，可改 'YYYYMMDD-HHmmss' 精确到秒；
-#       metadata-action 的 tags 输入块内不支持 # 注释，只能写在这里。
+# 多架构说明：
+#   amd64 用 ubuntu-latest 原生构建；arm64 默认用 ubuntu-24.04-arm 原生构建。
+#   原生构建比 QEMU 模拟快数倍，本仓库要编译大量 PHP 扩展，差别尤其明显。
+#   若仓库没有 ARM runner（私有仓库需 Team/Enterprise 套餐），手动触发时把
+#   arm-runner 填 ubuntu-latest，会自动改用 QEMU 模拟（耗时更长）。
+#
+# 注意：两个 job 里的 tags 配置必须保持一致（build 用于标签元数据，merge 用于出索引）。
+#      metadata-action 的 tags 输入块内不支持 # 注释，说明只能写在这里。
 # =============================================================================
 name: Build & Push Images
 
@@ -41,9 +47,13 @@ on:
         required: false
         default: ''
       platforms:
-        description: '目标平台'
+        description: '目标平台（逗号分隔）'
         required: false
-        default: 'linux/amd64'
+        default: 'linux/amd64,linux/arm64'
+      arm-runner:
+        description: 'arm64 构建用哪个 runner（没有 ARM runner 时填 ubuntu-latest，走 QEMU 模拟）'
+        required: false
+        default: 'ubuntu-24.04-arm'
       push:
         description: '是否推送到 GHCR'
         required: false
@@ -59,12 +69,13 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. 扫描目录，生成构建矩阵
+  # 1. 扫描目录，生成「镜像 × 平台」构建矩阵
   # ---------------------------------------------------------------------------
   detect:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
+      images: ${{ steps.gen.outputs.images }}
       prefix: ${{ steps.gen.outputs.prefix }}
     steps:
       - uses: actions/checkout@v4
@@ -73,14 +84,14 @@ jobs:
         id: gen
         env:
           ONLY: ${{ github.event.inputs.images }}
+          PLATFORMS: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
+          ARM_RUNNER: ${{ github.event.inputs.arm-runner || 'ubuntu-24.04-arm' }}
         run: |
           set -euo pipefail
 
-          # GHCR 要求全小写，这里统一处理 owner/repo
           prefix="${REGISTRY}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
           echo "prefix=${prefix}" >> "$GITHUB_OUTPUT"
 
-          # 允许的 Dockerfile 名称
           mapfile -t files < <(find . -mindepth 2 -maxdepth 4 \
             \( -iname 'Dockerfile' -o -iname '*.dockerfile' -o -iname 'Containerfile' \) \
             -not -path './.github/*' -not -path './.git/*' | sort)
@@ -89,7 +100,6 @@ jobs:
             echo "::error::未发现任何 Dockerfile"; exit 1
           fi
 
-          # --only 过滤
           if [ -n "${ONLY}" ]; then
             IFS=',' read -ra wanted <<< "${ONLY}"
             filtered=()
@@ -104,12 +114,15 @@ jobs:
             files=("${filtered[@]}")
           fi
 
-          items=()
+          IFS=',' read -ra plats <<< "${PLATFORMS}"
+
+          image_items=()
+          combos=()
+
           for f in "${files[@]}"; do
             dir=$(dirname "$f"); dir=${dir#./}
             [ -f "${dir}/.ignore" ] && continue
 
-            # 镜像名：目录路径 / -> -，全小写
             name=$(echo "$dir" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
             [ -f "${dir}/.image-name" ] && name=$(tr -d '[:space:]' < "${dir}/.image-name")
 
@@ -117,44 +130,64 @@ jobs:
             [ -f "${dir}/VERSION" ] && version=$(tr -d '[:space:]' < "${dir}/VERSION")
             [ -f "${dir}/.version" ] && version=$(tr -d '[:space:]' < "${dir}/.version")
 
-            # 版本号符合 X.Y.Z 时，额外派生 X.Y 与 X
             v_minor=""; v_major=""
             if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
               v_minor="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
               v_major="${BASH_REMATCH[1]}"
             fi
 
-            items+=("$(jq -n \
+            image_items+=("$(jq -n \
               --arg name "$name" \
-              --arg context "$dir" \
-              --arg dockerfile "$(basename "$f")" \
               --arg version "$version" \
               --arg v_minor "$v_minor" \
               --arg v_major "$v_major" \
-              '{name:$name, context:$context, dockerfile:$dockerfile, version:$version, v_minor:$v_minor, v_major:$v_major}')")
+              '{name:$name, version:$version, v_minor:$v_minor, v_major:$v_major}')")
+
+            for p in "${plats[@]}"; do
+              p=$(echo "$p" | tr -d '[:space:]')
+              [ -z "$p" ] && continue
+              arch="${p##*/}"
+              case "$arch" in
+                amd64|386|i386) runner="ubuntu-latest" ;;
+                *)              runner="${ARM_RUNNER}" ;;
+              esac
+
+              combos+=("$(jq -n \
+                --arg name "$name" \
+                --arg context "$dir" \
+                --arg dockerfile "$(basename "$f")" \
+                --arg version "$version" \
+                --arg v_minor "$v_minor" \
+                --arg v_major "$v_major" \
+                --arg platform "$p" \
+                --arg arch "$arch" \
+                --arg runner "$runner" \
+                '{name:$name, context:$context, dockerfile:$dockerfile, version:$version,
+                  v_minor:$v_minor, v_major:$v_major, platform:$platform, arch:$arch, runner:$runner}')")
+            done
           done
 
-          matrix=$(printf '%s\n' "${items[@]}" | jq -sc '.')
+          images=$(printf '%s\n' "${image_items[@]}" | jq -sc '.')
+          matrix=$(printf '%s\n' "${combos[@]}" | jq -sc '.')
+          echo "images=${images}" >> "$GITHUB_OUTPUT"
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
           {
-            echo "### 构建矩阵"
+            echo "### 构建矩阵（镜像 × 平台）"
             echo '```json'
             echo "$matrix" | jq .
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # 2. 构建并推送
+  # 2. 每个平台用原生 runner 构建，按 digest 推送（不打标签）
   # ---------------------------------------------------------------------------
   build:
     needs: detect
     if: needs.detect.outputs.matrix != '[]' && needs.detect.outputs.matrix != ''
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -186,8 +219,9 @@ jobs:
             } >> "$GITHUB_OUTPUT"
           fi
 
+      # 只有在 x86 runner 上跑非 amd64 架构时才需要 QEMU（arm-runner 填了 ubuntu-latest 的情况）
       - uses: docker/setup-qemu-action@v3
-        if: contains(github.event.inputs.platforms, 'arm64') || contains(github.event.inputs.platforms, 'arm')
+        if: matrix.runner == 'ubuntu-latest' && matrix.arch != 'amd64'
 
       - uses: docker/setup-buildx-action@v3
 
@@ -197,6 +231,91 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 镜像元数据
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.detect.outputs.prefix }}/${{ matrix.name }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=pr,prefix=pr-
+            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ matrix.version }},enable=${{ matrix.version != '' }}
+            type=raw,value=${{ matrix.v_minor }},enable=${{ matrix.v_minor != '' }}
+            type=raw,value=${{ matrix.v_major }},enable=${{ matrix.v_major != '' }}
+            type=sha,format=short,prefix=sha-
+            type=raw,value={{date 'YYYYMMDD'}}-{{sha}},enable={{is_default_branch}}
+
+      - name: 构建并推送（仅 digest）
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.context }}/${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          build-args: ${{ steps.args.outputs.value }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          # 关闭证明清单，否则 GHCR 的 OS/Arch 会多出无法识别的 unknown/unknown
+          provenance: false
+          sbom: false
+          outputs: ${{ (github.event_name != 'pull_request' && github.event.inputs.push != 'false') && format('type=image,name={0}/{1},push-by-digest=true,name-canonical=true,push=true', needs.detect.outputs.prefix, matrix.name) || '' }}
+          cache-from: type=gha,scope=${{ matrix.name }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}-${{ matrix.arch }}
+
+      - name: 记录 digest
+        if: github.event_name != 'pull_request' && github.event.inputs.push != 'false'
+        run: |
+          mkdir -p /tmp/digests/${{ matrix.name }}
+          echo '${{ steps.build.outputs.digest }}' > /tmp/digests/${{ matrix.name }}/${{ matrix.arch }}.txt
+          cat /tmp/digests/${{ matrix.name }}/${{ matrix.arch }}.txt
+
+      - name: 上传 digest
+        if: github.event_name != 'pull_request' && github.event.inputs.push != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.name }}-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.name }}/${{ matrix.arch }}.txt
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. 合并各架构 manifest 为多架构索引，并打上全部标签
+  # ---------------------------------------------------------------------------
+  merge:
+    needs: [detect, build]
+    if: github.event_name != 'pull_request' && github.event.inputs.push != 'false' && needs.detect.outputs.images != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect.outputs.images) }}
+
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 收集各架构 digest
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-${{ matrix.name }}-*
+          merge-multiple: true
+          path: /tmp/digests/${{ matrix.name }}
 
       - name: 计算标签
         id: meta
@@ -218,55 +337,50 @@ jobs:
             type=sha,format=short,prefix=sha-
             type=raw,value={{date 'YYYYMMDD'}}-{{sha}},enable={{is_default_branch}}
 
-      - name: 构建并推送
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.context }}/${{ matrix.dockerfile }}
-          platforms: ${{ github.event.inputs.platforms || 'linux/amd64' }}
-          build-args: ${{ steps.args.outputs.value }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          annotations: ${{ steps.meta.outputs.annotations }}
-          # 必须关闭：开启后 buildx 会在镜像 index 里附加 attestation manifest，
-          # GHCR 的 OS/Arch 列表会多出一条无法识别的 unknown/unknown
-          provenance: false
-          sbom: false
-          push: ${{ github.event_name != 'pull_request' && github.event.inputs.push != 'false' }}
-          load: ${{ github.event_name == 'pull_request' }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
-
-      - name: 来源证明 (SLSA)
-        if: github.event_name != 'pull_request' && github.event.inputs.push != 'false'
-        uses: actions/attest-build-provenance@v1
-        with:
-          subject-name: ${{ needs.detect.outputs.prefix }}/${{ matrix.name }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          # 存到 GitHub 证明库即可（gh attestation verify 可校验）；
-          # 若设为 true 会再往 registry 推一条 attestation manifest，同样出现 unknown/unknown
-          push-to-registry: false
-
-      - name: 保存镜像摘要
+      - name: 合并多架构索引
+        id: merge
         run: |
-          echo '${{ needs.detect.outputs.prefix }}/${{ matrix.name }}@${{ steps.build.outputs.digest }}' \
-            > "digest-${{ matrix.name }}.txt"
-          cat "digest-${{ matrix.name }}.txt"
+          set -euo pipefail
+          image="${{ needs.detect.outputs.prefix }}/${{ matrix.name }}"
 
-      - name: 上传产物摘要
-        uses: actions/upload-artifact@v4
-        with:
-          name: digest-${{ matrix.name }}
-          path: digest-${{ matrix.name }}.txt
-          if-no-files-found: warn
+          digests=()
+          for f in /tmp/digests/${{ matrix.name }}/*.txt; do
+            digests+=("${image}@$(tr -d '[:space:]' < "$f")")
+          done
+          if [ ${#digests[@]} -eq 0 ]; then
+            echo "::error::没有收集到任何架构的 digest"; exit 1
+          fi
 
-      - name: 写入构建摘要
-        run: |
+          args=()
+          while IFS= read -r t; do
+            [ -n "$t" ] && args+=("-t" "$t")
+          done <<< '${{ steps.meta.outputs.tags }}'
+
+          echo "合并 ${#digests[@]} 个架构，写入 $((${#args[@]} / 2)) 个标签"
+          docker buildx imagetools create "${args[@]}" "${digests[@]}"
+
+          primary="${args[1]}"
+          echo "primary=${primary}" >> "$GITHUB_OUTPUT"
+          index_digest=$(docker buildx imagetools inspect "${image}:${primary}" --format '{{.Manifest.Digest}}' || true)
+          echo "index_digest=${index_digest}" >> "$GITHUB_OUTPUT"
+
           {
             echo "### \`${{ matrix.name }}\`"
+            echo ""
             echo '```'
             echo '${{ steps.meta.outputs.tags }}'
             echo '```'
-            echo "digest: \`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "多架构索引：\`${image}:${primary}\` @ \`${index_digest}\`"
+            for d in "${digests[@]}"; do echo "- \`${d}\`"; done
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 来源证明 (SLSA)
+        if: steps.merge.outputs.index_digest != ''
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ needs.detect.outputs.prefix }}/${{ matrix.name }}
+          subject-digest: ${{ steps.merge.outputs.index_digest }}
+          # 存在 GitHub 证明库即可（gh attestation verify 可校验）；
+          # 若设为 true 会往 registry 再推一条 attestation manifest，同样出现 unknown/unknown
+          push-to-registry: false
