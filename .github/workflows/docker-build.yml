@@ -147,8 +147,10 @@ jobs:
               p=$(echo "$p" | tr -d '[:space:]')
               [ -z "$p" ] && continue
               arch="${p##*/}"
+              # runner 固定到具体版本，不用 ubuntu-latest：
+              # 避免 GitHub 把 latest 指向新发行版时，两个架构的构建环境不一致
               case "$arch" in
-                amd64|386|i386) runner="ubuntu-latest" ;;
+                amd64|386|i386) runner="ubuntu-24.04" ;;
                 *)              runner="${ARM_RUNNER}" ;;
               esac
 
