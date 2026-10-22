@@ -229,8 +229,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
-          provenance: ${{ github.event_name != 'pull_request' }}
-          sbom: ${{ github.event_name != 'pull_request' }}
+          # 必须关闭：开启后 buildx 会在镜像 index 里附加 attestation manifest，
+          # GHCR 的 OS/Arch 列表会多出一条无法识别的 unknown/unknown
+          provenance: false
+          sbom: false
           push: ${{ github.event_name != 'pull_request' && github.event.inputs.push != 'false' }}
           load: ${{ github.event_name == 'pull_request' }}
           cache-from: type=gha,scope=${{ matrix.name }}
@@ -242,7 +244,9 @@ jobs:
         with:
           subject-name: ${{ needs.detect.outputs.prefix }}/${{ matrix.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
+          # 存到 GitHub 证明库即可（gh attestation verify 可校验）；
+          # 若设为 true 会再往 registry 推一条 attestation manifest，同样出现 unknown/unknown
+          push-to-registry: false
 
       - name: 保存镜像摘要
         run: |
