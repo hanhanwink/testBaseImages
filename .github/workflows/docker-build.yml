@@ -1,0 +1,263 @@
+# =============================================================================
+# 目录即镜像（Directory-as-Image）自动构建流水线
+# -----------------------------------------------------------------------------
+# 规则：仓库根目录下每个含 Dockerfile 的子目录 = 一个镜像，推送到本仓库的 GHCR。
+#
+# 目录 -> 镜像名：
+#   php/            -> ghcr.io/<owner>/<repo>/php
+#   php/8.2/        -> ghcr.io/<owner>/<repo>/php-8.2      (斜杠转连字符)
+#   node/frontend/  -> ghcr.io/<owner>/<repo>/node-frontend (全小写)
+#
+# 可选元数据文件（放在镜像目录内）：
+#   .image-name      覆盖镜像名，    例：php-fpm
+#   VERSION          版本标签来源，  例：8.2.0  -> 额外产出 :8.2.0 / :8.2 / :8
+#   build-args.env   构建参数，每行 KEY=VALUE
+#   .ignore          存在则跳过该目录
+#
+# 标准 Tag 命名（本流水线默认产出）：
+#   latest          仅默认分支，始终指向最新稳定构建
+#   <branch>        分支名（/ 转 -），如 main、feat-x
+#   pr-<n>          PR 预览（不推送，仅构建校验）
+#   sha-<7>         短 commit SHA，不可变、可回滚，排障首选
+#   <version>       目录 VERSION 文件内容
+#   vX.Y.Z / X.Y / X  git tag 触发时按 semver 拆解
+#   YYYYMMDD        每日构建快照，便于对比回滚
+# =============================================================================
+name: Build & Push Images
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      images:
+        description: '只构建指定镜像（逗号分隔，留空=全部）'
+        required: false
+        default: ''
+      platforms:
+        description: '目标平台'
+        required: false
+        default: 'linux/amd64'
+      push:
+        description: '是否推送到 GHCR'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. 扫描目录，生成构建矩阵
+  # ---------------------------------------------------------------------------
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      prefix: ${{ steps.gen.outputs.prefix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 生成矩阵
+        id: gen
+        env:
+          ONLY: ${{ github.event.inputs.images }}
+        run: |
+          set -euo pipefail
+
+          # GHCR 要求全小写，这里统一处理 owner/repo
+          prefix="${REGISTRY}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "prefix=${prefix}" >> "$GITHUB_OUTPUT"
+
+          # 允许的 Dockerfile 名称
+          mapfile -t files < <(find . -mindepth 2 -maxdepth 4 \
+            \( -iname 'Dockerfile' -o -iname '*.dockerfile' -o -iname 'Containerfile' \) \
+            -not -path './.github/*' -not -path './.git/*' | sort)
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::未发现任何 Dockerfile"; exit 1
+          fi
+
+          # --only 过滤
+          if [ -n "${ONLY}" ]; then
+            IFS=',' read -ra wanted <<< "${ONLY}"
+            filtered=()
+            for f in "${files[@]}"; do
+              d=$(dirname "$f"); d=${d#./}
+              for w in "${wanted[@]}"; do
+                if [ "$(echo "$d" | tr '/' '-' | tr -d '[:space:]')" = "$(echo "$w" | tr -d '[:space:]')" ]; then
+                  filtered+=("$f")
+                fi
+              done
+            done
+            files=("${filtered[@]}")
+          fi
+
+          items=()
+          for f in "${files[@]}"; do
+            dir=$(dirname "$f"); dir=${dir#./}
+            [ -f "${dir}/.ignore" ] && continue
+
+            # 镜像名：目录路径 / -> -，全小写
+            name=$(echo "$dir" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+            [ -f "${dir}/.image-name" ] && name=$(tr -d '[:space:]' < "${dir}/.image-name")
+
+            version=""
+            [ -f "${dir}/VERSION" ] && version=$(tr -d '[:space:]' < "${dir}/VERSION")
+            [ -f "${dir}/.version" ] && version=$(tr -d '[:space:]' < "${dir}/.version")
+
+            # 版本号符合 X.Y.Z 时，额外派生 X.Y 与 X
+            v_minor=""; v_major=""
+            if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              v_minor="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+              v_major="${BASH_REMATCH[1]}"
+            fi
+
+            items+=("$(jq -n \
+              --arg name "$name" \
+              --arg context "$dir" \
+              --arg dockerfile "$(basename "$f")" \
+              --arg version "$version" \
+              --arg v_minor "$v_minor" \
+              --arg v_major "$v_major" \
+              '{name:$name, context:$context, dockerfile:$dockerfile, version:$version, v_minor:$v_minor, v_major:$v_major}')")
+          done
+
+          matrix=$(printf '%s\n' "${items[@]}" | jq -sc '.')
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 构建矩阵"
+            echo '```json'
+            echo "$matrix" | jq .
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 2. 构建并推送
+  # ---------------------------------------------------------------------------
+  build:
+    needs: detect
+    if: needs.detect.outputs.matrix != '[]' && needs.detect.outputs.matrix != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备构建参数
+        id: args
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -f "${{ matrix.context }}/build-args.env" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              [ -z "$line" ] && continue
+              case "$line" in \#*) continue;; esac
+              args+=("$line")
+            done < "${{ matrix.context }}/build-args.env"
+          fi
+          if [ ${#args[@]} -eq 0 ]; then
+            echo "value=" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo 'value<<EOF'
+              printf '%s\n' "${args[@]}"
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+        if: contains(github.event.inputs.platforms, 'arm64') || contains(github.event.inputs.platforms, 'arm')
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.detect.outputs.prefix }}/${{ matrix.name }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=pr,prefix=pr-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ matrix.version }},enable=${{ matrix.version != '' }}
+            type=raw,value=${{ matrix.v_minor }},enable=${{ matrix.v_minor != '' }}
+            type=raw,value=${{ matrix.v_major }},enable=${{ matrix.v_major != '' }}
+            type=sha,format=short,prefix=sha-
+            type=raw,value={{date 'YYYYMMDD'}},enable={{is_default_branch}}
+
+      - name: 构建并推送
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.context }}/${{ matrix.dockerfile }}
+          platforms: ${{ github.event.inputs.platforms || 'linux/amd64' }}
+          build-args: ${{ steps.args.outputs.value }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: ${{ github.event_name != 'pull_request' }}
+          sbom: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' && github.event.inputs.push != 'false' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      - name: 来源证明 (SLSA)
+        if: github.event_name != 'pull_request' && github.event.inputs.push != 'false'
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ needs.detect.outputs.prefix }}/${{ matrix.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: 保存镜像摘要
+        run: |
+          echo '${{ needs.detect.outputs.prefix }}/${{ matrix.name }}@${{ steps.build.outputs.digest }}' \
+            > "digest-${{ matrix.name }}.txt"
+          cat "digest-${{ matrix.name }}.txt"
+
+      - name: 上传产物摘要
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.name }}
+          path: digest-${{ matrix.name }}.txt
+          if-no-files-found: warn
+
+      - name: 写入构建摘要
+        run: |
+          {
+            echo "### \`${{ matrix.name }}\`"
+            echo '```'
+            echo '${{ steps.meta.outputs.tags }}'
+            echo '```'
+            echo "digest: \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
