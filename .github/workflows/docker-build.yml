@@ -78,7 +78,7 @@ jobs:
       images: ${{ steps.gen.outputs.images }}
       prefix: ${{ steps.gen.outputs.prefix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 生成矩阵
         id: gen
@@ -197,7 +197,7 @@ jobs:
         include: ${{ fromJson(needs.detect.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 准备构建参数
         id: args
@@ -222,12 +222,12 @@ jobs:
           fi
 
       # 只有在 x86 runner 上跑非 amd64 架构时才需要 QEMU（arm-runner 填了 ubuntu-latest 的情况）
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
         if: matrix.runner == 'ubuntu-latest' && matrix.arch != 'amd64'
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
@@ -236,7 +236,7 @@ jobs:
 
       - name: 镜像元数据
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ needs.detect.outputs.prefix }}/${{ matrix.name }}
           flavor: |
@@ -256,7 +256,7 @@ jobs:
 
       - name: 构建并推送（仅 digest）
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.context }}/${{ matrix.dockerfile }}
@@ -280,7 +280,7 @@ jobs:
 
       - name: 上传 digest
         if: github.event_name != 'pull_request' && github.event.inputs.push != 'false'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digests-${{ matrix.name }}-${{ matrix.arch }}
           path: /tmp/digests/${{ matrix.name }}/${{ matrix.arch }}.txt
@@ -304,16 +304,16 @@ jobs:
         include: ${{ fromJson(needs.detect.outputs.images) }}
 
     steps:
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 收集各架构 digest
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: digests-${{ matrix.name }}-*
           merge-multiple: true
@@ -321,7 +321,7 @@ jobs:
 
       - name: 计算标签
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ needs.detect.outputs.prefix }}/${{ matrix.name }}
           flavor: |
@@ -379,7 +379,7 @@ jobs:
 
       - name: 来源证明 (SLSA)
         if: steps.merge.outputs.index_digest != ''
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ needs.detect.outputs.prefix }}/${{ matrix.name }}
           subject-digest: ${{ steps.merge.outputs.index_digest }}
